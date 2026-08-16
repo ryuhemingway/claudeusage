@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Ship a new claudeusage release.
+# Ship a new claudemax release.
 #
 #   ./release.sh 1.2.0
 #
@@ -20,15 +20,15 @@ VERSION="${1:-}"
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TAP_DIR="${TAP_DIR:-$HOME/Desktop/Projects/homebrew-tap}"
 REGION="${AWS_REGION:-us-east-1}"
-FUNCTION="claudeusage-community"
+FUNCTION="claudeusage-community"   # AWS resource name kept: renaming it would change the Function URL
 TABLE="ClaudeUsageCommunity"
 
 cd "$REPO_DIR"
 
 # --- preflight ---------------------------------------------------------------
-IN_SCRIPT="$(sed -n "s/^__version__ = '\(.*\)'$/\1/p" claudeusage)"
+IN_SCRIPT="$(sed -n "s/^__version__ = '\(.*\)'$/\1/p" claudemax)"
 if [ "$IN_SCRIPT" != "$VERSION" ]; then
-  echo "claudeusage says __version__ = '$IN_SCRIPT' but you asked to release $VERSION."
+  echo "claudemax says __version__ = '$IN_SCRIPT' but you asked to release $VERSION."
   echo "Bump __version__ in the script, commit, then re-run."
   exit 1
 fi
@@ -40,24 +40,24 @@ fi
 
 # --- 1. tag the source -------------------------------------------------------
 echo "==> tagging v$VERSION"
-git tag -a "v$VERSION" -m "claudeusage $VERSION"
+git tag -a "v$VERSION" -m "claudemax $VERSION"
 git push origin main
 git push origin "v$VERSION"
 
 # --- 2. update the formula ---------------------------------------------------
 echo "==> waiting for the release tarball"
-URL="https://github.com/ryuhemingway/claudeusage/archive/refs/tags/v$VERSION.tar.gz"
+URL="https://github.com/ryuhemingway/ClaudeMaxing/archive/refs/tags/v$VERSION.tar.gz"
 for _ in $(seq 1 20); do
-  curl -fsL -o /tmp/claudeusage-release.tar.gz "$URL" && break
+  curl -fsL -o /tmp/claudemax-release.tar.gz "$URL" && break
   sleep 3
 done
-SHA="$(shasum -a 256 /tmp/claudeusage-release.tar.gz | cut -d' ' -f1)"
+SHA="$(shasum -a 256 /tmp/claudemax-release.tar.gz | cut -d' ' -f1)"
 echo "    sha256 $SHA"
 
-FORMULA="$TAP_DIR/Formula/claudeusage.rb"
+FORMULA="$TAP_DIR/Formula/claudemax.rb"
 /usr/bin/sed -i '' -e "s|url \".*\"|url \"$URL\"|" -e "s|sha256 \".*\"|sha256 \"$SHA\"|" "$FORMULA"
-( cd "$TAP_DIR" && git add Formula/claudeusage.rb \
-  && git commit -q -m "claudeusage $VERSION" && git push -q origin main )
+( cd "$TAP_DIR" && git add Formula/claudemax.rb \
+  && git commit -q -m "claudemax $VERSION" && git push -q origin main )
 echo "    formula updated and pushed"
 
 # --- 3. announce it to installs that opted in --------------------------------
@@ -69,5 +69,5 @@ aws lambda wait function-updated --region "$REGION" --function-name "$FUNCTION"
 
 echo
 echo "released $VERSION"
-echo "  users on brew:  brew update && brew upgrade claudeusage"
+echo "  users on brew:  brew update && brew upgrade claudemax"
 echo "  opted-in installs see the update banner within a day"

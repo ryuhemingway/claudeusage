@@ -1,4 +1,4 @@
-# claudeusage
+# ClaudeMaxing
 
 A terminal dashboard for your Claude Code usage. It reads the session
 transcripts Claude Code already writes to disk and reports per-day tokens,
@@ -60,9 +60,9 @@ invoice.
 
 ## Privacy
 
-**Out of the box, claudeusage makes no network requests of any kind.** It reads
+**Out of the box, ClaudeMaxing makes no network requests of any kind.** It reads
 local files under your Claude Code config directory and writes one scan cache at
-`~/.claude/usage-cache.json` holding per-day token counts and byte offsets.
+`~/.claude/claudemax-cache.json` holding per-day token counts and byte offsets.
 
 There are optional community features — a comparison line on the graph, a
 leaderboard, and update notifications — and they are **off until you turn them
@@ -87,11 +87,11 @@ The service that receives this is [~200 lines in `server/`](server/lambda_functi
 ```sh
 brew tap ryuhemingway/tap
 brew trust ryuhemingway/tap     # Homebrew 6+ asks this once for third-party taps
-brew install claudeusage
+brew install claudemax
 ```
 
-After that first tap, `brew install claudeusage` and `brew upgrade claudeusage`
-work by bare name. (A bare `brew install claudeusage` on a machine that has
+After that first tap, `brew install claudemax` and `brew upgrade claudemax`
+work by bare name. (A bare `brew install claudemax` on a machine that has
 never tapped can't work — Homebrew would have to find the formula in
 homebrew-core, which has a notability bar this repo doesn't meet yet.)
 
@@ -100,14 +100,14 @@ homebrew-core, which has a notability bar this repo doesn't meet yet.)
 Requires Python 3.8+ (standard library only — no pip install, no dependencies).
 
 ```sh
-git clone https://github.com/ryuhemingway/claudeusage.git
-cd claudeusage
-chmod +x claudeusage
+git clone https://github.com/ryuhemingway/ClaudeMaxing.git
+cd ClaudeMaxing
+chmod +x claudemax
 mkdir -p ~/.local/bin
-ln -s "$PWD/claudeusage" ~/.local/bin/claudeusage
+ln -s "$PWD/claudemax" ~/.local/bin/claudemax
 ```
 
-Then run `claudeusage`. If the command isn't found, `~/.local/bin` isn't on
+Then run `claudemax`. If the command isn't found, `~/.local/bin` isn't on
 your `PATH` — add it:
 
 ```sh
@@ -120,28 +120,28 @@ symlinking is fine — the symlink just means `git pull` updates the command.
 ## Usage
 
 ```
-claudeusage              last 14 active days
-claudeusage 30           last 30 active days
-claudeusage all          everything on disk
-claudeusage --cli        only interactive CLI traffic (exclude SDK/desktop)
-claudeusage --recent 2   split the delta block at the last 2 days
-claudeusage --models     per-model breakdown
-claudeusage --json       machine-readable dump
-claudeusage --no-color   plain output, no ANSI escapes
-claudeusage --refresh    discard the incremental cache and rescan
-claudeusage --help       usage summary
+claudemax                last 14 active days
+claudemax 30           last 30 active days
+claudemax all          everything on disk
+claudemax --cli        only interactive CLI traffic (exclude SDK/desktop)
+claudemax --recent 2   split the delta block at the last 2 days
+claudemax --models     per-model breakdown
+claudemax --json       machine-readable dump
+claudemax --no-color   plain output, no ANSI escapes
+claudemax --refresh    discard the incremental cache and rescan
+claudemax --help       usage summary
 ```
 
-Flags combine: `claudeusage 30 --cli --models --recent 7`.
+Flags combine: `claudemax 30 --cli --models --recent 7`.
 
 ### Community (opt-in)
 
 ```
-claudeusage --graph          your daily cost, your average, everyone's average
-claudeusage --leaderboard    public ranking of installs that chose a handle
-claudeusage --community on   start sharing anonymous daily totals (or: off)
-claudeusage --handle NAME    appear on the leaderboard under NAME
-claudeusage --check-update   ask whether a newer release exists
+claudemax --graph          your daily cost, your average, everyone's average
+claudemax --leaderboard    public ranking of installs that chose a handle
+claudemax --community on   start sharing anonymous daily totals (or: off)
+claudemax --handle NAME    appear on the leaderboard under NAME
+claudemax --check-update   ask whether a newer release exists
 ```
 
 `--graph` works offline — it just draws your daily cost, your own average, and
@@ -151,7 +151,7 @@ the top edge and labelled `(off scale)`, so your own series stays readable
 instead of being squashed into the floor.
 
 ```
-  YOU VS EVERYONE  ·  cost per day  ·  128 installs sharing
+  YOU VS EVERYONE  ·  cost per day  ·  42 installs sharing
   ──────────────────────────────────────────────────────────────────────────
         $33 ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
                            ●  │
@@ -173,15 +173,31 @@ rather than naive substring search, so `therapist`, `tycoon`, `Scunthorpe` and
 `grape` are fine while `the_rapist` is not.
 
 Setting a handle is a second, separate opt-in: with `--community on` alone you
-are counted in the average and can see your own rank privately, but you do not
-appear on the public board.
+are counted in the community figure and can see your own rank privately, but
+you do not appear on the public board.
+
+### These numbers are self-reported
+
+There is no account system and no way to verify a report, so treat the
+leaderboard as a vanity board rather than a measurement. Two things keep it
+from being trivially wrecked:
+
+- every published community figure is a **median**, not a mean, so it is
+  unmoved by any minority of fabricated installs — a single fake report moves a
+  mean enormously and a median not at all
+- an install must have reported at least 3 days before it counts toward the
+  community figure or appears on the board, so one-shot submissions do nothing
+
+Someone determined enough to register more fake installs than there are real
+ones can still shift the median. Fixing that properly needs authentication,
+which is a bigger thing than a vanity board justifies.
 
 ## Updates
 
-`brew upgrade claudeusage` is the update path, and it needs no network code in
-the tool itself. If you have opted into community features, claudeusage also
+`brew upgrade claudemax` is the update path, and it needs no network code in
+the tool itself. If you have opted into community features, claudemax also
 checks once a day whether a newer version has shipped and prints a one-line
-notice. `claudeusage --check-update` asks on demand regardless of that setting.
+notice. `claudemax --check-update` asks on demand regardless of that setting.
 
 The first run indexes every transcript on disk and may take a few seconds.
 After that it only reads the bytes appended since the last run, so subsequent
@@ -189,7 +205,7 @@ runs are near-instant.
 
 ## Reading the output
 
-**Only active days count.** `claudeusage 14` means your last 14 days *with
+**Only active days count.** `claudemax 14` means your last 14 days *with
 usage*, not the last 14 calendar days. A week off doesn't leave gaps in the
 chart.
 
@@ -216,7 +232,7 @@ Claude Code writes one JSONL file per session under
 relocated your config directory with `CLAUDE_CONFIG_DIR`, the tool follows it.
 
 Claude Code deletes transcripts after 30 days by default (`cleanupPeriodDays`
-in `settings.json`), so `claudeusage all` reaches back only as far as your
+in `settings.json`), so `claudemax all` reaches back only as far as your
 retention setting allows.
 
 ## Pricing table

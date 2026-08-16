@@ -28,7 +28,8 @@ _ddb = boto3.resource('dynamodb')
 _table = _ddb.Table(TABLE)
 
 KEEP_DAYS = 30          # per-install history retained
-WINDOW_DAYS = 7         # trailing window the published averages use
+WINDOW_DAYS = 7         # trailing window the published figures use
+MIN_DAYS = 3            # an install must have this many days before it counts
 LEADERBOARD_SIZE = 10
 
 # Sanity clamps. A report outside these is treated as junk and dropped, so one
@@ -165,15 +166,28 @@ def _report(payload):
     return _resp(200, {'ok': True, 'days_recorded': len(days)})
 
 
-def _avg_of(days):
-    """Mean daily tokens/cost/prompts over that install's trailing window."""
+def _median(xs):
+    s = sorted(xs)
+    n = len(s)
+    if not n:
+        return 0.0
+    mid = n // 2
+    return float(s[mid]) if n % 2 else (float(s[mid - 1]) + float(s[mid])) / 2.0
+
+
+def _median_of(days):
+    """Median daily tokens/cost/prompts over that install's trailing window.
+
+    Reports are self-reported and unauthenticated, so every published figure is
+    a median rather than a mean: a mean is moved by every fabricated install,
+    a median is not moved by any minority of them.
+    """
     recent = [days[d] for d in sorted(days)[-WINDOW_DAYS:]]
-    if not recent:
-        return None
-    n = len(recent)
-    return (sum(int(r['t']) for r in recent) / n,
-            sum(float(r['c']) for r in recent) / n,
-            sum(int(r['p']) for r in recent) / n)
+    if len(recent) < MIN_DAYS:
+        return None                # one-shot submissions never count
+    return (_median([int(r['t']) for r in recent]),
+            _median([float(r['c']) for r in recent]),
+            _median([int(r['p']) for r in recent]))
 
 
 def _collect():
@@ -189,21 +203,21 @@ def _collect():
 
     per_install = []
     for row in rows:
-        avg = _avg_of(row.get('days') or {})
-        if avg:
-            per_install.append((row['install_id'], row.get('handle'), avg))
+        med = _median_of(row.get('days') or {})
+        if med:
+            per_install.append((row['install_id'], row.get('handle'), med))
 
     if not per_install:
-        return {'installs': 0, 'avg_tokens_day': 0, 'avg_cost_day': 0.0,
-                'avg_prompts_day': 0.0, 'leaderboard': []}
+        return {'installs': 0, 'median_tokens_day': 0, 'median_cost_day': 0.0,
+                'median_prompts_day': 0.0, 'leaderboard': [],
+                'avg_tokens_day': 0, 'avg_cost_day': 0.0}
 
-    n = len(per_install)
     ranked = sorted(per_install, key=lambda r: -r[2][0])
-    return {
-        'installs': n,
-        'avg_tokens_day': round(sum(r[2][0] for r in per_install) / n),
-        'avg_cost_day': round(sum(r[2][1] for r in per_install) / n, 4),
-        'avg_prompts_day': round(sum(r[2][2] for r in per_install) / n, 2),
+    body = {
+        'installs': len(per_install),
+        'median_tokens_day': round(_median([r[2][0] for r in per_install])),
+        'median_cost_day': round(_median([r[2][1] for r in per_install]), 4),
+        'median_prompts_day': round(_median([r[2][2] for r in per_install]), 2),
         # Ranks are computed over everyone; only handled installs are listed.
         '_ranked_ids': [r[0] for r in ranked],
         'leaderboard': [
@@ -212,6 +226,12 @@ def _collect():
             for i, (_, h, a) in enumerate(ranked) if h
         ][:LEADERBOARD_SIZE],
     }
+    # Back-compat for clients shipped before the switch to medians. Same value,
+    # so an older install shows the robust figure rather than a spoofable mean.
+    body['avg_tokens_day'] = body['median_tokens_day']
+    body['avg_cost_day'] = body['median_cost_day']
+    body['avg_prompts_day'] = body['median_prompts_day']
+    return body
 
 
 def _stats(install_id):
