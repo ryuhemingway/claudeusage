@@ -120,7 +120,7 @@ symlinking is fine — the symlink just means `git pull` updates the command.
 ## Usage
 
 ```
-claudemax                last 14 active days
+claudemax              last 14 active days
 claudemax 30           last 30 active days
 claudemax all          everything on disk
 claudemax --cli        only interactive CLI traffic (exclude SDK/desktop)
@@ -148,9 +148,9 @@ claudemax --check-update      ask whether a newer release exists
 The graph and leaderboard are part of the normal dashboard — no flag needed.
 The graph works offline, drawing your daily cost, your own average and today.
 Turning sharing on adds the community median as a second reference line and
-fills in the leaderboard. When the community average is far above your own usage it is pinned to
-the top edge and labelled `(off scale)`, so your own series stays readable
-instead of being squashed into the floor.
+fills in the leaderboard. When the community median sits far above your own usage it is pinned to the
+top edge and labelled off scale, so your own series stays readable instead of
+being squashed into the floor.
 
 ```
   YOU VS EVERYONE  ·  cost per day  ·  42 installs sharing
@@ -166,7 +166,7 @@ instead of being squashed into the floor.
          $0
             Aug 09       Aug 15
 
-  ● your daily cost   ◆ today   ─ your avg $12   ╌ everyone $103 (off scale)
+  ● your daily cost   ◆ today   ─ your avg $12   ╌ everyone (median) $103 - off scale
 ```
 
 Handles are screened for profanity and slurs on the server, so the check cannot
