@@ -86,9 +86,13 @@ The service that receives this is [~200 lines in `server/`](server/lambda_functi
 
 ```sh
 brew tap ryuhemingway/tap
-brew trust ryuhemingway/tap     # Homebrew 6+ asks this once for third-party taps
+brew trust ryuhemingway/tap     # Homebrew 6+ only; skip if it says "Unknown command"
 brew install claudemax
 ```
+
+Homebrew 6.0.0 added a trust gate on third-party taps, so without the middle
+line `brew install` stops with *"Refusing to load formula from untrusted tap"*.
+Older Homebrew has no such gate and no `brew trust` command — skip that line.
 
 After that first tap, `brew install claudemax` and `brew upgrade claudemax`
 work by bare name. (A bare `brew install claudemax` on a machine that has
