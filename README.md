@@ -82,6 +82,21 @@ The service that receives this is [~200 lines in `server/`](server/lambda_functi
 
 ## Install
 
+### One command
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/ryuhemingway/ClaudeMaxing/main/install.sh | sh
+```
+
+Drops the single script into `~/.local/bin`. No sudo, no build step, nothing
+compiled. If you would rather read it before running it — reasonable, it is
+[40 lines](install.sh) — download it first:
+
+```sh
+curl -fsSL -O https://raw.githubusercontent.com/ryuhemingway/ClaudeMaxing/main/install.sh
+less install.sh && sh install.sh
+```
+
 ### Homebrew
 
 ```sh
