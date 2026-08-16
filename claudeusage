@@ -1,0 +1,525 @@
+#!/usr/bin/env python3
+"""claudeusage - token, cost and efficiency dashboard for Claude Code transcripts.
+
+Reads ~/.claude/projects/**/*.jsonl and reports per-day tokens, equivalent API
+cost, model mix, a cost bar chart, and a period-over-period delta.
+
+Costs are EQUIVALENT API COST (list price). On a subscription these are a proxy
+for rate-limit weight, not a bill.
+
+Usage:
+  claudeusage              last 14 active days
+  claudeusage 30           last 30 active days
+  claudeusage all          everything on disk
+  claudeusage --cli        only interactive CLI traffic (exclude SDK/desktop)
+  claudeusage --recent 2   split the delta block at the last 2 days
+  claudeusage --models     per-model breakdown
+  claudeusage --json       machine-readable dump
+  claudeusage --no-color   plain output, no ANSI escapes
+  claudeusage --refresh    discard the incremental cache and rescan
+  claudeusage --help       this message
+
+Transcripts are read from $CLAUDE_CONFIG_DIR (default ~/.claude). Nothing is
+sent anywhere; the only file written is a scan cache next to that directory.
+"""
+import json
+import os
+import sys
+import glob
+from datetime import datetime
+
+CONFIG = os.environ.get('CLAUDE_CONFIG_DIR') or os.path.join(os.path.expanduser('~'), '.claude')
+ROOT = os.path.join(CONFIG, 'projects')
+CACHE = os.path.join(CONFIG, 'usage-cache.json')  # outside projects/ so it never scans itself
+CACHE_VERSION = 3
+
+# ---------------------------------------------------------------- pricing ---
+# $/MTok (input, output) at Anthropic list price.
+# Cache read = 0.1x input; cache write 5m = 1.25x; cache write 1h = 2x.
+#
+# Matched by prefix, first hit wins, so a specific id must be listed before any
+# shorter id it shares a stem with (claude-opus-4-1 before claude-opus-4).
+PRICES = (
+    ('claude-fable',            10.0, 50.0),
+    ('claude-mythos',           10.0, 50.0),
+
+    ('claude-opus-5',            5.0, 25.0),
+    ('claude-opus-4-8',          5.0, 25.0),
+    ('claude-opus-4-7',          5.0, 25.0),
+    ('claude-opus-4-6',          5.0, 25.0),
+    ('claude-opus-4-5',          5.0, 25.0),
+    ('claude-opus-4-1',         15.0, 75.0),
+    ('claude-opus-4-0',         15.0, 75.0),
+    ('claude-opus-4-20250514',  15.0, 75.0),
+    ('claude-opus-4',            5.0, 25.0),   # unrecognised 4.x -> current opus rate
+    ('claude-3-opus',           15.0, 75.0),
+    ('claude-opus',              5.0, 25.0),
+
+    ('claude-sonnet-5',          2.0, 10.0),
+    ('claude-sonnet-4',          3.0, 15.0),
+    ('claude-3-7-sonnet',        3.0, 15.0),
+    ('claude-3-5-sonnet',        3.0, 15.0),
+    ('claude-3-sonnet',          3.0, 15.0),
+    ('claude-sonnet',            3.0, 15.0),
+
+    ('claude-haiku-4-5',         1.0,  5.0),
+    ('claude-3-5-haiku',         0.80, 4.00),
+    ('claude-3-haiku',           0.25, 1.25),
+    ('claude-haiku',             1.0,  5.0),
+)
+
+
+def rates(model):
+    """(input, output) $/MTok for a model id, or None if it isn't priced here."""
+    for prefix, tin, tout in PRICES:
+        if model.startswith(prefix):
+            return tin, tout
+    return None
+
+
+# counter slots: input, output, cache_read, write_1h, write_5m, write_unsplit, thinking, messages
+SLOTS = 8
+I_IN, I_OUT, I_CR, I_W1H, I_W5M, I_WUN, I_THINK, I_MSG = range(SLOTS)
+
+
+def new_day():
+    return {'m': {}, 'p': 0, 't': 0, 'c': 0, 's': []}
+
+
+def merge_day(dst, src):
+    for model, vals in src['m'].items():
+        cur = dst['m'].setdefault(model, [0] * SLOTS)
+        for i in range(SLOTS):
+            cur[i] += vals[i]
+    dst['p'] += src['p']
+    dst['t'] += src['t']
+    dst['c'] += src['c']
+    if src['s']:
+        dst['s'] = list(set(dst['s']) | set(src['s']))
+
+
+def merge_tree(dst, src):
+    """tree shape: {day: {entrypoint: day_counters}}"""
+    for day, eps in src.items():
+        d = dst.setdefault(day, {})
+        for ep, counters in eps.items():
+            merge_day(d.setdefault(ep, new_day()), counters)
+
+
+# ---------------------------------------------------------------- parsing ---
+def scan(path, start):
+    """Parse from byte `start`; return (tree, offset_of_last_complete_line)."""
+    tree = {}
+    consumed = start
+    with open(path, 'rb') as f:
+        f.seek(start)
+        buf = b''
+        while True:
+            chunk = f.read(1 << 20)
+            if not chunk:
+                break
+            buf += chunk
+            parts = buf.split(b'\n')
+            buf = parts.pop()
+            for raw in parts:
+                consumed += len(raw) + 1
+                if raw.strip():
+                    ingest(tree, raw)
+    return tree, consumed
+
+
+def ingest(tree, raw):
+    try:
+        rec = json.loads(raw)
+    except Exception:
+        return
+    ts = rec.get('timestamp')
+    if not ts:
+        return
+    try:
+        day = datetime.fromisoformat(ts.replace('Z', '+00:00')).astimezone().strftime('%Y-%m-%d')
+    except Exception:
+        return
+
+    ep = rec.get('entrypoint') or 'unknown'
+    D = tree.setdefault(day, {}).setdefault(ep, new_day())
+
+    sid = rec.get('sessionId')
+    if sid and sid not in D['s']:
+        D['s'].append(sid)
+
+    typ = rec.get('type')
+    sidechain = rec.get('isSidechain', False)
+    msg = rec.get('message') or {}
+    content = msg.get('content')
+
+    if typ == 'user' and not sidechain:
+        if rec.get('isCompactSummary'):
+            D['c'] += 1
+        elif isinstance(content, str):
+            D['p'] += 1
+        elif isinstance(content, list) and not any(
+                isinstance(b, dict) and b.get('type') == 'tool_result' for b in content):
+            D['p'] += 1
+        return
+
+    if typ != 'assistant':
+        return
+
+    model = msg.get('model') or 'unknown'
+    if model.startswith('<'):        # <synthetic> etc - not billable
+        return
+    v = D['m'].setdefault(model, [0] * SLOTS)
+    u = msg.get('usage') or {}
+    cw = u.get('cache_creation_input_tokens', 0) or 0
+    cc = u.get('cache_creation') or {}
+    w1h = cc.get('ephemeral_1h_input_tokens', 0) or 0
+    w5m = cc.get('ephemeral_5m_input_tokens', 0) or 0
+
+    v[I_IN] += u.get('input_tokens', 0) or 0
+    v[I_OUT] += u.get('output_tokens', 0) or 0
+    v[I_CR] += u.get('cache_read_input_tokens', 0) or 0
+    v[I_W1H] += w1h
+    v[I_W5M] += w5m
+    v[I_WUN] += max(0, cw - w1h - w5m)     # unsplit -> priced at 1h (conservative)
+    v[I_THINK] += (u.get('output_tokens_details') or {}).get('thinking_tokens', 0) or 0
+    v[I_MSG] += 1
+
+    if isinstance(content, list):
+        D['t'] += sum(1 for b in content if isinstance(b, dict) and b.get('type') == 'tool_use')
+
+
+def load(refresh=False):
+    cache = {'version': CACHE_VERSION, 'files': {}}
+    if not refresh and os.path.exists(CACHE):
+        try:
+            got = json.load(open(CACHE))
+            if got.get('version') == CACHE_VERSION:
+                cache = got
+        except Exception:
+            pass
+
+    files = sorted(glob.glob(os.path.join(ROOT, '**', '*.jsonl'), recursive=True))
+    cache['files'] = {p: v for p, v in cache['files'].items() if p in set(files)}
+
+    todo = []
+    for p in files:
+        try:
+            size = os.path.getsize(p)
+        except OSError:
+            continue
+        ent = cache['files'].get(p)
+        if ent is None or size < ent['offset']:
+            todo.append((p, 0, None))
+        elif size > ent['offset']:
+            todo.append((p, ent['offset'], ent))
+
+    if todo:
+        label = 'indexing' if len(todo) > 40 else 'updating'
+        print(f'{label} {len(todo)} transcript file(s)...', file=sys.stderr, flush=True)
+
+    for p, start, ent in todo:
+        try:
+            tree, offset = scan(p, start)
+        except OSError:
+            continue
+        if ent is None or start == 0:
+            cache['files'][p] = {'offset': offset, 'days': tree}
+        else:
+            merge_tree(ent['days'], tree)
+            ent['offset'] = offset
+
+    try:
+        tmp = CACHE + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(cache, f, separators=(',', ':'))
+        os.replace(tmp, CACHE)
+    except OSError:
+        pass
+
+    combined = {}
+    for ent in cache['files'].values():
+        merge_tree(combined, ent['days'])
+    return combined
+
+
+# ---------------------------------------------------------------- costing ---
+def flatten(tree, cli_only):
+    """-> {day: {tokens..., cost, msgs, tools, prompts, compactions, sessions, models}}"""
+    out = {}
+    for day, eps in tree.items():
+        row = {'in': 0, 'out': 0, 'cr': 0, 'cw': 0, 'think': 0, 'cost': 0.0,
+               'cost_in': 0.0, 'cost_out': 0.0, 'cost_cr': 0.0, 'cost_cw': 0.0,
+               'msgs': 0, 'tools': 0, 'prompts': 0, 'compactions': 0,
+               'sessions': set(), 'models': {}, 'unpriced': 0}
+        for ep, D in eps.items():
+            if cli_only and ep != 'cli':
+                continue
+            row['prompts'] += D['p']
+            row['tools'] += D['t']
+            row['compactions'] += D['c']
+            row['sessions'] |= set(D['s'])
+            for model, v in D['m'].items():
+                r = rates(model)
+                w1h = v[I_W1H] + v[I_WUN]
+                cw = w1h + v[I_W5M]
+                row['in'] += v[I_IN]
+                row['out'] += v[I_OUT]
+                row['cr'] += v[I_CR]
+                row['cw'] += cw
+                row['think'] += v[I_THINK]
+                row['msgs'] += v[I_MSG]
+                if r is None:
+                    row['unpriced'] += v[I_IN] + v[I_OUT] + v[I_CR] + cw
+                    c = 0.0
+                else:
+                    tin, tout = r
+                    ci = v[I_IN] * tin / 1e6
+                    co = v[I_OUT] * tout / 1e6
+                    cr = v[I_CR] * tin * 0.1 / 1e6
+                    cwc = (w1h * tin * 2.0 + v[I_W5M] * tin * 1.25) / 1e6
+                    row['cost_in'] += ci
+                    row['cost_out'] += co
+                    row['cost_cr'] += cr
+                    row['cost_cw'] += cwc
+                    c = ci + co + cr + cwc
+                row['cost'] += c
+                m = row['models'].setdefault(model, {'msgs': 0, 'tokens': 0, 'cost': 0.0})
+                m['msgs'] += v[I_MSG]
+                m['tokens'] += v[I_IN] + v[I_OUT] + v[I_CR] + cw
+                m['cost'] += c
+        if row['msgs'] or row['prompts']:
+            row['sessions'] = len(row['sessions'])
+            row['tokens'] = row['in'] + row['out'] + row['cr'] + row['cw']
+            out[day] = row
+    return out
+
+
+# ---------------------------------------------------------------- display ---
+BLOCKS = ' ▏▎▍▌▋▊▉█'
+USE_COLOR = sys.stdout.isatty()
+
+
+def c(text, code):
+    return f'\033[{code}m{text}\033[0m' if USE_COLOR else text
+
+
+DIM, BOLD, CYAN, GREEN, RED, YEL = '2', '1', '36', '32', '31', '33'
+
+
+def bar(frac, width):
+    frac = max(0.0, min(1.0, frac))
+    total = frac * width
+    full = int(total)
+    s = '█' * full
+    rem = int((total - full) * 8)
+    if rem:
+        s += BLOCKS[rem]
+    return s.ljust(width)
+
+
+def toks(n):
+    if n >= 1e9:
+        return f'{n / 1e9:.2f}B'
+    if n >= 100e6:
+        return f'{n / 1e6:,.0f}M'
+    if n >= 1e6:
+        return f'{n / 1e6:.1f}M'
+    if n >= 1e3:
+        return f'{n / 1e3:.0f}K'
+    return str(int(n))
+
+
+def money(v):
+    if v >= 1000:
+        return f'${v:,.0f}'
+    if v >= 10:
+        return f'${v:.0f}'
+    return f'${v:.2f}'
+
+
+def pct_delta(new, old, color=True):
+    """Percent change, capped so a near-zero baseline can't print +113990%."""
+    if not old:
+        return c('   -  ', DIM)
+    d = (new / old - 1) * 100
+    s = ('>+999%' if d > 999 else f'{d:+.0f}%').rjust(6)
+    if not color:
+        return s
+    return c(s, GREEN if d < -1 else RED if d > 1 else DIM)
+
+
+def main():
+    args = sys.argv[1:]
+    if '--help' in args or '-h' in args:
+        print(__doc__.strip())
+        return
+    cli_only = '--cli' in args
+    show_models = '--models' in args
+    as_json = '--json' in args
+    refresh = '--refresh' in args
+    global USE_COLOR
+    if '--no-color' in args:
+        USE_COLOR = False
+
+    recent_n = None
+    if '--recent' in args:
+        i = args.index('--recent')
+        if i + 1 >= len(args) or not args[i + 1].isdigit() or int(args[i + 1]) < 1:
+            sys.exit('--recent needs a positive number of days, e.g. --recent 2')
+        recent_n = int(args.pop(i + 1))
+
+    window = 14
+    for a in args:
+        if a.startswith('-'):
+            continue
+        if a == 'all':
+            window = 10 ** 6
+        elif a.isdigit():
+            window = int(a)
+
+    if not os.path.isdir(ROOT):
+        sys.exit(f'no transcripts at {ROOT}')
+
+    days = flatten(load(refresh), cli_only)
+    if not days:
+        sys.exit('no usage found')
+
+    keys = sorted(days)[-window:]
+    if as_json:
+        print(json.dumps({k: days[k] for k in keys}, indent=1, default=str))
+        return
+
+    today = datetime.now().strftime('%Y-%m-%d')
+    tot = {k: sum(days[d][k] for d in keys)
+           for k in ('tokens', 'in', 'out', 'cr', 'cw', 'think', 'cost', 'cost_in',
+                     'cost_out', 'cost_cr', 'cost_cw', 'msgs', 'tools', 'prompts',
+                     'compactions', 'sessions', 'unpriced')}
+
+    scope = 'CLI only' if cli_only else 'all entrypoints'
+    span = 'all time' if window >= 10 ** 6 else f'last {len(keys)} active days'
+    print()
+    print(c(f'  Claude Code usage  ·  {span}  ·  {scope}', BOLD))
+    print(c('  ' + '─' * 74, DIM))
+    print(f"  {c(toks(tot['tokens']) + ' tokens', CYAN)}   {c(money(tot['cost']) + ' equiv', CYAN)}"
+          f"   {tot['prompts']:,} prompts   {tot['msgs']:,} msgs"
+          f"   {tot['tools']:,} tools   {tot['compactions']} compactions")
+    print()
+
+    # ---- per-day chart
+    peak = max(days[d]['cost'] for d in keys) or 1.0
+    print(c('  DAY        COST  ' + 'cost per day'.center(30) + '   MSGS   TOOLS  $/PROMPT     Δ', DIM))
+    prev = None
+    for d in keys:
+        r = days[d]
+        pp = r['cost'] / r['prompts'] if r['prompts'] else 0
+        label = datetime.strptime(d, '%Y-%m-%d').strftime('%b %d')
+        mark = c('*', YEL) if d == today else ' '
+        delta = pct_delta(r['cost'], prev) if prev is not None else c('   -  ', DIM)
+        print(f"  {label}{mark} {money(r['cost']):>6}  {c(bar(r['cost'] / peak, 30), CYAN)} "
+              f" {r['msgs']:>6,} {r['tools']:>7,} {('$%.2f' % pp):>9}  {delta}")
+        prev = r['cost']
+    if today in keys:
+        print(c('  * today - partial day', DIM))
+    print()
+
+    # ---- where the cost goes
+    print(c('  WHERE IT GOES        TOKENS         COST   SHARE', DIM))
+    rows = [('cache read', tot['cr'], tot['cost_cr']),
+            ('cache write', tot['cw'], tot['cost_cw']),
+            ('output', tot['out'], tot['cost_out']),
+            ('input', tot['in'], tot['cost_in'])]
+    for name, tk, cs in sorted(rows, key=lambda x: -x[2]):
+        share = cs / tot['cost'] if tot['cost'] else 0
+        print(f"  {name:<14} {toks(tk):>10} {money(cs):>12}   {share * 100:4.1f}%  "
+              f"{c(bar(share, 16), CYAN)}")
+    if tot['out']:
+        print(c(f"  thinking is {tot['think'] / tot['out'] * 100:.0f}% of output tokens", DIM))
+    print()
+
+    # ---- models
+    if show_models:
+        agg = {}
+        for d in keys:
+            for m, v in days[d]['models'].items():
+                a = agg.setdefault(m, {'msgs': 0, 'tokens': 0, 'cost': 0.0})
+                for k in a:
+                    a[k] += v[k]
+        print(c('  BY MODEL                        MSGS      TOKENS         COST   SHARE', DIM))
+        for m, v in sorted(agg.items(), key=lambda x: -x[1]['cost']):
+            share = v['cost'] / tot['cost'] * 100 if tot['cost'] else 0
+            name = m.replace('claude-', '')
+            flag = '' if rates(m) else c('  (unpriced)', YEL)
+            print(f"  {name:<24} {v['msgs']:>10,} {toks(v['tokens']):>11} "
+                  f"{money(v['cost']):>12}   {share:4.1f}%{flag}")
+        print()
+
+    # ---- delta block
+    n = len(keys)
+    if n >= 2:
+        rn = recent_n if recent_n else max(1, n // 2)
+        rn = min(rn, n - 1)
+        base_k, rec_k = keys[:-rn], keys[-rn:]
+
+        def per_day(ks, field):
+            return sum(days[d][field] for d in ks) / len(ks)
+
+        def per_unit(ks, num, den):
+            dd = sum(days[d][den] for d in ks)
+            return sum(days[d][num] for d in ks) / dd if dd else 0
+
+        print(c(f'  DELTA   last {len(rec_k)} days  vs  prior {len(base_k)} days', BOLD))
+        print(c('  ' + '─' * 74, DIM))
+        print(c(f"  {'':<22}{'baseline':>12}{'recent':>12}{'change':>10}", DIM))
+        # `eff` marks rows where lower is genuinely better; volume rows stay
+        # uncoloured, since doing less work is not an improvement.
+        for label, kind, a, b_, eff in (
+                ('cost / day', 'day', 'cost', None, False),
+                ('cache read / day', 'day', 'cr', None, False),
+                ('cache write / day', 'day', 'cw', None, False),
+                ('output tok / day', 'day', 'out', None, False),
+                ('prompts / day', 'day', 'prompts', None, False),
+                ('assistant msgs / day', 'day', 'msgs', None, False),
+                ('tool calls / day', 'day', 'tools', None, False),
+                ('compactions / day', 'day', 'compactions', None, False),
+                (None, None, None, None, None),
+                ('msgs / prompt', 'unit', 'msgs', 'prompts', False),
+                ('tool calls / prompt', 'unit', 'tools', 'prompts', False),
+                ('output tok / prompt', 'unit', 'out', 'prompts', False),
+                (None, None, None, None, None),
+                ('$ / prompt', 'unit', 'cost', 'prompts', True),
+                ('$ / assistant msg', 'unit', 'cost', 'msgs', True),
+                ('$ / tool call', 'unit', 'cost', 'tools', True),
+                ('cache read / prompt', 'unit', 'cr', 'prompts', True)):
+            if label is None:
+                print(c('  ' + '·' * 74, DIM))
+                continue
+            if kind == 'day':
+                ov, nv = per_day(base_k, a), per_day(rec_k, a)
+            else:
+                ov, nv = per_unit(base_k, a, b_), per_unit(rec_k, a, b_)
+            if a in ('cr', 'cw', 'out'):
+                fo, fn = toks(int(ov)), toks(int(nv))
+            elif a == 'cost':
+                fo, fn = (money(ov), money(nv)) if kind == 'day' else ('$%.2f' % ov, '$%.2f' % nv)
+            else:
+                fo, fn = f'{ov:,.1f}', f'{nv:,.1f}'
+            hi = BOLD if label == '$ / prompt' else DIM
+            print(f"  {c(label.ljust(22), hi)}{fo:>12}{fn:>12}{pct_delta(nv, ov, eff):>10}")
+        print()
+        print(c('  $ / assistant msg falls automatically when context is compacted, so it', DIM))
+        print(c('  overstates efficiency. $ / prompt is the measure that survives; read it', DIM))
+        print(c('  against tool calls and output per prompt to see what the money bought.', DIM))
+
+    if tot['unpriced']:
+        print(c(f"\n  note: {toks(tot['unpriced'])} tokens from unpriced models excluded from cost", YEL))
+    print(c('\n  equivalent API cost at list price; on a subscription this is rate-limit weight,', DIM))
+    print(c('  not a bill. Cache writes without a TTL field are priced at the 1h rate.', DIM))
+    print()
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (BrokenPipeError, KeyboardInterrupt):
+        pass
