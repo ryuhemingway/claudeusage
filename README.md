@@ -67,12 +67,13 @@ token counts and byte offsets — never prompt or response text.
 
 ## Install
 
-Requires Python 3.7+ (standard library only — no pip install, no dependencies).
+Requires Python 3.8+ (standard library only — no pip install, no dependencies).
 
 ```sh
 git clone https://github.com/ryuhemingway/claudeusage.git
 cd claudeusage
 chmod +x claudeusage
+mkdir -p ~/.local/bin
 ln -s "$PWD/claudeusage" ~/.local/bin/claudeusage
 ```
 
