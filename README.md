@@ -137,16 +137,18 @@ Flags combine: `claudemax 30 --cli --models --recent 7`.
 ### Community (opt-in)
 
 ```
-claudemax --graph          your daily cost, your average, everyone's average
-claudemax --leaderboard    public ranking of installs that chose a handle
-claudemax --community on   start sharing anonymous daily totals (or: off)
-claudemax --handle NAME    appear on the leaderboard under NAME
-claudemax --check-update   ask whether a newer release exists
+claudemax --handle NAME       appear on the leaderboard under NAME
+claudemax --community on      share anonymous daily totals without a handle
+claudemax --community off     stop sharing
+claudemax --no-graph          hide the line graph
+claudemax --no-leaderboard    hide the leaderboard
+claudemax --check-update      ask whether a newer release exists
 ```
 
-`--graph` works offline — it just draws your daily cost, your own average, and
-today. Turning sharing on adds the community average as a second reference
-line. When the community average is far above your own usage it is pinned to
+The graph and leaderboard are part of the normal dashboard — no flag needed.
+The graph works offline, drawing your daily cost, your own average and today.
+Turning sharing on adds the community median as a second reference line and
+fills in the leaderboard. When the community average is far above your own usage it is pinned to
 the top edge and labelled `(off scale)`, so your own series stays readable
 instead of being squashed into the floor.
 
@@ -185,8 +187,8 @@ from being trivially wrecked:
 - every published community figure is a **median**, not a mean, so it is
   unmoved by any minority of fabricated installs — a single fake report moves a
   mean enormously and a median not at all
-- an install must have reported at least 3 days before it counts toward the
-  community figure or appears on the board, so one-shot submissions do nothing
+- figures cover a trailing 22-day window, so one unusual day cannot swing a
+  standing
 
 Someone determined enough to register more fake installs than there are real
 ones can still shift the median. Fixing that properly needs authentication,

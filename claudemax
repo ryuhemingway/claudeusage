@@ -19,12 +19,14 @@ Usage:
   claudemax --refresh    discard the incremental cache and rescan
   claudemax --help       this message
 
-Community (all opt-in, all off by default):
-  claudemax --graph          your daily cost, your average, everyone's average
-  claudemax --leaderboard    public ranking of installs that chose a handle
-  claudemax --community on   start sharing anonymous daily totals (or: off)
-  claudemax --handle NAME    appear on the leaderboard under NAME
-  claudemax --check-update   ask whether a newer release exists
+The graph and leaderboard are shown by default. Community comparison is
+opt-in and off until you turn it on:
+  claudemax --handle NAME       appear on the leaderboard under NAME
+  claudemax --community on      share anonymous daily totals without a handle
+  claudemax --community off     stop sharing
+  claudemax --no-graph          hide the line graph
+  claudemax --no-leaderboard    hide the leaderboard
+  claudemax --check-update      ask whether a newer release exists
 
 Transcripts are read from $CLAUDE_CONFIG_DIR (default ~/.claude). With sharing
 off - the default - the tool makes no network requests of any kind.
@@ -37,7 +39,7 @@ import glob
 import time
 from datetime import datetime
 
-__version__ = '2.0.0'
+__version__ = '2.1.0'
 
 CONFIG = os.environ.get('CLAUDE_CONFIG_DIR') or os.path.join(os.path.expanduser('~'), '.claude')
 ROOT = os.path.join(CONFIG, 'projects')
@@ -541,15 +543,17 @@ def line_graph(keys, days, community, today):
     if comm_avg > 0:
         r = row(comm_avg)
         grid[r] = [('╌', YEL)] * ncol
+    # '═' marks a row where your average and the community median coincide.
     r = row(you_avg)
-    grid[r] = [('─', GREEN) if ch == ' ' else ('┿', GREEN) for ch, _ in grid[r]]
+    both = comm_avg > 0 and r == row(comm_avg)
+    grid[r] = [(('═' if both else '─'), GREEN) for _ in grid[r]]
 
     prev = None
     for i, v in enumerate(vals):
         x, r = i * step, row(v)
         if prev is not None:
             for rr in range(*sorted((prev, r))):
-                if grid[rr][x][0] in ' ─╌┿':
+                if grid[rr][x][0] in ' ─╌═':      # data draws over reference lines
                     grid[rr][x] = ('│', CYAN)
         is_today = keys[i] == today
         grid[r][x] = ('◆', BOLD) if is_today else ('●', CYAN)
@@ -567,16 +571,23 @@ def line_graph(keys, days, community, today):
                            ''.join(c(ch, col) if col else ch for ch, col in line)))
 
     axis = [' '] * ncol
-    for i, d in enumerate(keys):
-        if i in (0, len(keys) - 1) or (step >= 3 and i % 5 == 0):
-            lab = datetime.strptime(d, '%Y-%m-%d').strftime('%b %d')
-            x = min(max(0, i * step - 2), ncol - len(lab))
-            axis[x:x + len(lab)] = lab
+    taken = set()
+    # First and last anchor the axis; interior ticks fill in only where they
+    # fit, so labels never run into each other.
+    order = [0, len(keys) - 1] + [i for i in range(1, len(keys) - 1) if i % 5 == 0]
+    for i in order:
+        lab = datetime.strptime(keys[i], '%Y-%m-%d').strftime('%b %d')
+        x = min(max(0, i * step - 2), max(0, ncol - len(lab)))
+        span = set(range(x - 1, x + len(lab) + 1))
+        if span & taken:
+            continue
+        axis[x:x + len(lab)] = lab
+        taken |= span
     print('  %s %s' % (' ' * gutter, c(''.join(axis), DIM)))
     print()
     legend = ['%s your daily cost' % c('●', CYAN),
               '%s today' % c('◆', BOLD),
-              '%s your avg %s' % (c('─', GREEN), money(you_avg))]
+              '%s your avg %s' % (c('═' if both else '─', GREEN), money(you_avg))]
     if comm_avg > 0:
         legend.append('%s everyone (median) %s%s' % (c('╌', YEL), money(comm_avg),
                                                      ' - off scale' if off_scale else ''))
@@ -586,8 +597,8 @@ def line_graph(keys, days, community, today):
 def render_leaderboard(community, cfg):
     board = community.get('leaderboard') or []
     installs = community.get('installs') or 0
-    print(c('  LEADERBOARD  ·  median tokens/day, trailing 7 days  ·  %d installs sharing'
-            % installs, BOLD))
+    print(c('  LEADERBOARD  ·  median tokens/day, trailing %d days  ·  %d installs sharing'
+            % (community.get('window_days') or 22, installs), BOLD))
     print(c('  ' + '─' * 74, DIM))
     print(c('  figures are self-reported and unverified', DIM))
     if not board:
@@ -660,8 +671,10 @@ def main():
         print(c('  see where you land with:  claudemax --leaderboard', DIM))
         return
 
-    show_graph = '--graph' in args
-    show_board = '--leaderboard' in args
+    # The graph and leaderboard are part of the normal dashboard. The graph
+    # needs no network, and the board only appears once sharing is on.
+    show_graph = '--no-graph' not in args
+    show_board = '--no-leaderboard' not in args
     if '--check-update' in args:
         latest = check_update(force=True)
         print(f'  installed {__version__}; latest {latest or "unknown"}')
@@ -698,15 +711,23 @@ def main():
 
     community = None
     if cfg.get('enabled') and (show_graph or show_board):
-        community, note = community_sync(days, cfg, today)
-        if note:
-            print(c('  ' + note, YEL))
-        if community is None:
-            print(c('  (community server unreachable - showing local data only)', DIM))
+        # These sections are on by default now, so a plain run must not pay for
+        # a round trip every time. Re-sync at most every 15 minutes.
+        stale = refresh or (time.time() - cfg.get('stats_at', 0) > 900)
+        if not stale and cfg.get('stats'):
+            community = cfg['stats']
         else:
-            cfg['latest_version'] = community.get('latest_version')
-            cfg['update_checked_at'] = time.time()
-            save_community_config(cfg)
+            community, note = community_sync(days, cfg, today)
+            if note:
+                print(c('  ' + note, YEL))
+            if community is None:
+                print(c('  (community server unreachable - showing local data only)', DIM))
+                community = cfg.get('stats')          # fall back to last known
+            else:
+                cfg['stats'], cfg['stats_at'] = community, time.time()
+                cfg['latest_version'] = community.get('latest_version')
+                cfg['update_checked_at'] = time.time()
+                save_community_config(cfg)
 
     scope = 'CLI only' if cli_only else 'all entrypoints'
     span = 'all time' if window >= 10 ** 6 else f'last {len(keys)} active days'
@@ -745,6 +766,9 @@ def main():
         print(c(heading, BOLD))
         print(c('  ' + '─' * 74, DIM))
         line_graph(keys, days, community, today)
+        if not cfg.get('enabled'):
+            print(c('  turn on the comparison line and the leaderboard with:  '
+                    'claudemax --handle YOURNAME', DIM))
         print()
 
     # ---- where the cost goes
@@ -779,14 +803,8 @@ def main():
         print()
 
     # ---- leaderboard
-    if show_board:
-        if not cfg.get('enabled'):
-            print(c('  LEADERBOARD', BOLD))
-            print(c('  ' + '─' * 74, DIM))
-            print(c('  needs community sharing: run  claudemax --handle YOURNAME', DIM))
-            print()
-        elif community:
-            render_leaderboard(community, cfg)
+    if show_board and cfg.get('enabled') and community:
+        render_leaderboard(community, cfg)
 
     # ---- delta block
     n = len(keys)

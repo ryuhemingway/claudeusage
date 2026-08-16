@@ -28,8 +28,8 @@ _ddb = boto3.resource('dynamodb')
 _table = _ddb.Table(TABLE)
 
 KEEP_DAYS = 30          # per-install history retained
-WINDOW_DAYS = 7         # trailing window the published figures use
-MIN_DAYS = 3            # an install must have this many days before it counts
+WINDOW_DAYS = 22        # trailing window the published figures use
+MIN_DAYS = 1            # count an install from its very first reported day
 LEADERBOARD_SIZE = 10
 
 # Sanity clamps. A report outside these is treated as junk and dropped, so one
@@ -111,7 +111,7 @@ UUID_RE = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]
 DATE_RE = re.compile(r'^\d{4}-\d{2}-\d{2}$')
 
 _cache = {'at': 0.0, 'body': None}
-CACHE_TTL = 300
+CACHE_TTL = 60
 
 
 def _resp(code, body):
@@ -163,6 +163,9 @@ def _report(payload):
     if handle:
         item['handle'] = handle
     _table.put_item(Item=item)
+    # Drop the aggregate cache so the GET that follows this POST - which is what
+    # every client does - reflects the write instead of a stale board.
+    _cache['at'] = 0.0
     return _resp(200, {'ok': True, 'days_recorded': len(days)})
 
 
@@ -184,7 +187,7 @@ def _median_of(days):
     """
     recent = [days[d] for d in sorted(days)[-WINDOW_DAYS:]]
     if len(recent) < MIN_DAYS:
-        return None                # one-shot submissions never count
+        return None
     return (_median([int(r['t']) for r in recent]),
             _median([float(r['c']) for r in recent]),
             _median([int(r['p']) for r in recent]))
@@ -242,6 +245,7 @@ def _stats(install_id):
     ranked = body.pop('_ranked_ids', [])
     body['your_rank'] = (ranked.index(install_id) + 1) if install_id in ranked else None
     body['latest_version'] = LATEST_VERSION
+    body['window_days'] = WINDOW_DAYS
     return _resp(200, body)
 
 
