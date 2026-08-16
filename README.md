@@ -60,12 +60,42 @@ invoice.
 
 ## Privacy
 
-The tool reads only local files under your Claude Code config directory and
-sends nothing anywhere. It has no network code at all. The single file it
-writes is a scan cache at `~/.claude/usage-cache.json`, which stores per-day
-token counts and byte offsets — never prompt or response text.
+**Out of the box, claudeusage makes no network requests of any kind.** It reads
+local files under your Claude Code config directory and writes one scan cache at
+`~/.claude/usage-cache.json` holding per-day token counts and byte offsets.
+
+There are optional community features — a comparison line on the graph, a
+leaderboard, and update notifications — and they are **off until you turn them
+on**. With `--community on`, each run uploads, for complete days only:
+
+- a random install id, generated locally and not derived from you, your machine,
+  or your account
+- per day: total tokens, equivalent cost, prompt count
+- your handle, only if you chose one with `--handle`
+
+It never uploads file paths, project names, session ids, model names, or any
+prompt or response text. Today is excluded because it is still partial. Turn it
+all off again with `--community off`.
+
+The service that receives this is [~200 lines in `server/`](server/lambda_function.py)
+— that is the whole thing, so you can read exactly what is stored.
 
 ## Install
+
+### Homebrew
+
+```sh
+brew tap ryuhemingway/tap
+brew trust ryuhemingway/tap     # Homebrew 6+ asks this once for third-party taps
+brew install claudeusage
+```
+
+After that first tap, `brew install claudeusage` and `brew upgrade claudeusage`
+work by bare name. (A bare `brew install claudeusage` on a machine that has
+never tapped can't work — Homebrew would have to find the formula in
+homebrew-core, which has a notability bar this repo doesn't meet yet.)
+
+### From source
 
 Requires Python 3.8+ (standard library only — no pip install, no dependencies).
 
@@ -103,6 +133,55 @@ claudeusage --help       usage summary
 ```
 
 Flags combine: `claudeusage 30 --cli --models --recent 7`.
+
+### Community (opt-in)
+
+```
+claudeusage --graph          your daily cost, your average, everyone's average
+claudeusage --leaderboard    public ranking of installs that chose a handle
+claudeusage --community on   start sharing anonymous daily totals (or: off)
+claudeusage --handle NAME    appear on the leaderboard under NAME
+claudeusage --check-update   ask whether a newer release exists
+```
+
+`--graph` works offline — it just draws your daily cost, your own average, and
+today. Turning sharing on adds the community average as a second reference
+line. When the community average is far above your own usage it is pinned to
+the top edge and labelled `(off scale)`, so your own series stays readable
+instead of being squashed into the floor.
+
+```
+  YOU VS EVERYONE  ·  cost per day  ·  128 installs sharing
+  ──────────────────────────────────────────────────────────────────────────
+        $33 ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+                           ●  │
+                           │  │
+                     ●  │  │  │
+        $12 ───●──│──│──│──│──│
+               │  │  │  ●     │
+            ●     │  │        │
+                  ●           ◆
+         $0
+            Aug 09       Aug 15
+
+  ● your daily cost   ◆ today   ─ your avg $12   ╌ everyone $103 (off scale)
+```
+
+Handles are screened for profanity and slurs on the server, so the check cannot
+be bypassed by posting to the endpoint directly. The matcher is separator-aware
+rather than naive substring search, so `therapist`, `tycoon`, `Scunthorpe` and
+`grape` are fine while `the_rapist` is not.
+
+Setting a handle is a second, separate opt-in: with `--community on` alone you
+are counted in the average and can see your own rank privately, but you do not
+appear on the public board.
+
+## Updates
+
+`brew upgrade claudeusage` is the update path, and it needs no network code in
+the tool itself. If you have opted into community features, claudeusage also
+checks once a day whether a newer version has shipped and prints a one-line
+notice. `claudeusage --check-update` asks on demand regardless of that setting.
 
 The first run indexes every transcript on disk and may take a few seconds.
 After that it only reads the bytes appended since the last run, so subsequent

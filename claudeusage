@@ -19,14 +19,25 @@ Usage:
   claudeusage --refresh    discard the incremental cache and rescan
   claudeusage --help       this message
 
-Transcripts are read from $CLAUDE_CONFIG_DIR (default ~/.claude). Nothing is
-sent anywhere; the only file written is a scan cache next to that directory.
+Community (all opt-in, all off by default):
+  claudeusage --graph          your daily cost, your average, everyone's average
+  claudeusage --leaderboard    public ranking of installs that chose a handle
+  claudeusage --community on   start sharing anonymous daily totals (or: off)
+  claudeusage --handle NAME    appear on the leaderboard under NAME
+  claudeusage --check-update   ask whether a newer release exists
+
+Transcripts are read from $CLAUDE_CONFIG_DIR (default ~/.claude). With sharing
+off - the default - the tool makes no network requests of any kind.
 """
 import json
 import os
+import re
 import sys
 import glob
+import time
 from datetime import datetime
+
+__version__ = '1.1.0'
 
 CONFIG = os.environ.get('CLAUDE_CONFIG_DIR') or os.path.join(os.path.expanduser('~'), '.claude')
 ROOT = os.path.join(CONFIG, 'projects')
@@ -349,6 +360,225 @@ def pct_delta(new, old, color=True):
     return c(s, GREEN if d < -1 else RED if d > 1 else DIM)
 
 
+# -------------------------------------------------------------- community ---
+# Everything below this line is inert unless the user explicitly opts in with
+# `--community on`. With it off, the tool makes no network calls of any kind.
+COMMUNITY_ENDPOINT = 'https://6gouvwlyqlmaymaasfralmxuwi0wyvvk.lambda-url.us-east-1.on.aws/'
+COMMUNITY_CFG = os.path.join(CONFIG, 'usage-community.json')
+
+SHARE_NOTICE = """  Community sharing is ON. From now on these runs upload, for complete days only:
+
+      a random install id (not derived from you, your machine, or your account)
+      per day: total tokens, equivalent cost, prompt count
+      your handle, only if you set one with --handle
+
+  Never uploaded: file paths, project names, session ids, model names, and no
+  prompt or response text of any kind. Turn it off with --community off.
+  Server source: github.com/ryuhemingway/claudeusage/blob/main/server"""
+
+
+def version_tuple(v):
+    return tuple(int(x) for x in re.findall(r'\d+', v or '')) or (0,)
+
+
+def check_update(cfg=None, force=False):
+    """Latest published version, or None. Never phones home unless sharing is
+    on or the user explicitly asked. Cached for a day either way."""
+    cfg = community_config() if cfg is None else cfg
+    now = time.time()
+    if not force:
+        if not cfg.get('enabled'):
+            return None
+        if now - cfg.get('update_checked_at', 0) < 86400:
+            return cfg.get('latest_version')
+    import urllib.request
+    try:
+        with urllib.request.urlopen(COMMUNITY_ENDPOINT + 'stats', timeout=5.0) as r:
+            latest = json.loads(r.read().decode()).get('latest_version')
+    except Exception:
+        return cfg.get('latest_version')
+    cfg['latest_version'], cfg['update_checked_at'] = latest, now
+    save_community_config(cfg)
+    return latest
+
+
+def update_banner(latest):
+    if latest and version_tuple(latest) > version_tuple(__version__):
+        print(c(f'  claudeusage {latest} is available (you have {__version__}) - '
+                f'update with: brew upgrade claudeusage', YEL))
+
+
+def handle_available(name, timeout=15.0):
+    # Generous timeout on purpose: this is interactive, and a cold start on the
+    # stats service can take several seconds.
+    """Ask the server whether a handle is acceptable. (None if unreachable.)"""
+    import urllib.request
+    from urllib.parse import quote
+    try:
+        url = '%scheck-handle?handle=%s' % (COMMUNITY_ENDPOINT, quote(name))
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            return json.loads(r.read().decode())
+    except Exception:
+        return None
+
+
+def community_config():
+    """Load (or lazily create) the opt-in config. Creating it enables nothing."""
+    cfg = {}
+    try:
+        with open(COMMUNITY_CFG) as f:
+            cfg = json.load(f)
+    except Exception:
+        pass
+    if not cfg.get('install_id'):
+        import uuid
+        cfg['install_id'] = str(uuid.uuid4())   # random, not derived from anything
+        cfg.setdefault('enabled', False)
+        save_community_config(cfg)
+    return cfg
+
+
+def save_community_config(cfg):
+    try:
+        tmp = COMMUNITY_CFG + '.tmp'
+        with open(tmp, 'w') as f:
+            json.dump(cfg, f, indent=1)
+        os.replace(tmp, COMMUNITY_CFG)
+    except OSError:
+        pass
+
+
+def community_payload(days, cfg, today):
+    """Exactly what gets uploaded. Complete days only - today is still partial,
+    and sharing it would drag everyone's average down by a variable amount."""
+    shared = {}
+    for d in sorted(days)[-30:]:
+        if d == today:
+            continue
+        r = days[d]
+        shared[d] = {'t': int(r['tokens']), 'c': round(r['cost'], 4), 'p': int(r['prompts'])}
+    body = {'install_id': cfg['install_id'], 'days': shared}
+    if cfg.get('handle'):
+        body['handle'] = cfg['handle']
+    return body
+
+
+def community_sync(days, cfg, today, timeout=6.0):
+    """Upload our totals, then fetch the aggregate. None if unreachable."""
+    import urllib.request
+    payload = community_payload(days, cfg, today)
+    if payload['days']:
+        try:
+            req = urllib.request.Request(
+                COMMUNITY_ENDPOINT + 'report',
+                data=json.dumps(payload).encode(),
+                headers={'content-type': 'application/json'}, method='POST')
+            urllib.request.urlopen(req, timeout=timeout).read()
+        except Exception:
+            pass                      # best effort; never block the dashboard
+    try:
+        url = '%sstats?install_id=%s' % (COMMUNITY_ENDPOINT, cfg['install_id'])
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            return json.loads(r.read().decode())
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------- graphing ---
+GRAPH_HEIGHT = 11
+
+
+def line_graph(keys, days, community, today):
+    """Your daily cost, your average, the community average, and today, on one
+    chart. Reference lines are drawn first so the data series sits on top."""
+    vals = [days[d]['cost'] for d in keys]
+    you_avg = sum(vals) / len(vals)
+    comm_avg = float((community or {}).get('avg_cost_day') or 0.0)
+
+    step = 3 if len(keys) <= 20 else (2 if len(keys) <= 40 else 1)
+    ncol = max(1, (len(keys) - 1) * step + 1)
+
+    # A community average far above this user would flatten their own series
+    # into the floor, so the axis stays scaled to their data and the community
+    # line is pinned to the top edge and labelled as off-scale.
+    own_top = max(vals + [you_avg])
+    off_scale = comm_avg > own_top * 3
+    top = (own_top if off_scale else max(vals + [you_avg, comm_avg])) * 1.10 or 1.0
+
+    def row(v):
+        return int(round((1 - min(max(v, 0.0), top) / top) * (GRAPH_HEIGHT - 1)))
+
+    grid = [[(' ', None)] * ncol for _ in range(GRAPH_HEIGHT)]
+
+    if comm_avg > 0:
+        r = row(comm_avg)
+        grid[r] = [('╌', YEL)] * ncol
+    r = row(you_avg)
+    grid[r] = [('─', GREEN) if ch == ' ' else ('┿', GREEN) for ch, _ in grid[r]]
+
+    prev = None
+    for i, v in enumerate(vals):
+        x, r = i * step, row(v)
+        if prev is not None:
+            for rr in range(*sorted((prev, r))):
+                if grid[rr][x][0] in ' ─╌┿':
+                    grid[rr][x] = ('│', CYAN)
+        is_today = keys[i] == today
+        grid[r][x] = ('◆', BOLD) if is_today else ('●', CYAN)
+        prev = r
+
+    gutter = 9
+    marks = {0: money(top), row(you_avg): money(you_avg), GRAPH_HEIGHT - 1: '$0'}
+    if comm_avg > 0:
+        marks.setdefault(row(comm_avg), money(comm_avg))
+    for i, line in enumerate(grid):
+        label = marks.get(i, '')
+        while line and line[-1][0] == ' ':      # keep rows free of trailing pad
+            line = line[:-1]
+        print('  %s %s' % (c(label.rjust(gutter), DIM),
+                           ''.join(c(ch, col) if col else ch for ch, col in line)))
+
+    axis = [' '] * ncol
+    for i, d in enumerate(keys):
+        if i in (0, len(keys) - 1) or (step >= 3 and i % 5 == 0):
+            lab = datetime.strptime(d, '%Y-%m-%d').strftime('%b %d')
+            x = min(max(0, i * step - 2), ncol - len(lab))
+            axis[x:x + len(lab)] = lab
+    print('  %s %s' % (' ' * gutter, c(''.join(axis), DIM)))
+    print()
+    legend = ['%s your daily cost' % c('●', CYAN),
+              '%s today' % c('◆', BOLD),
+              '%s your avg %s' % (c('─', GREEN), money(you_avg))]
+    if comm_avg > 0:
+        legend.append('%s everyone %s%s' % (c('╌', YEL), money(comm_avg),
+                                            ' (off scale)' if off_scale else ''))
+    print('  ' + c('   '.join(legend), DIM))
+
+
+def render_leaderboard(community, cfg):
+    board = community.get('leaderboard') or []
+    installs = community.get('installs') or 0
+    print(c('  LEADERBOARD  ·  avg tokens/day, trailing 7 days  ·  %d installs sharing'
+            % installs, BOLD))
+    print(c('  ' + '─' * 74, DIM))
+    if not board:
+        print(c('  nobody has set a handle yet - be the first with --handle NAME', DIM))
+    mine = cfg.get('handle')
+    for row in board:
+        me = mine and row['handle'] == mine
+        print('  %s %2d. %-24s %10s  %9s/day' % (
+            c('▸', YEL) if me else ' ', row['rank'],
+            c(row['handle'], BOLD) if me else row['handle'],
+            toks(row['tokens_day']), money(row['cost_day'])))
+    rank = community.get('your_rank')
+    if rank:
+        shown = any(mine and r['handle'] == mine for r in board)
+        note = ('  you rank #%d of %d' % (rank, installs)) + (
+            '' if shown else ' - set --handle NAME to appear on the board')
+        print(c(note, DIM))
+    print()
+
+
 def main():
     args = sys.argv[1:]
     if '--help' in args or '-h' in args:
@@ -368,6 +598,47 @@ def main():
         if i + 1 >= len(args) or not args[i + 1].isdigit() or int(args[i + 1]) < 1:
             sys.exit('--recent needs a positive number of days, e.g. --recent 2')
         recent_n = int(args.pop(i + 1))
+
+    cfg = community_config()
+    if '--community' in args:
+        i = args.index('--community')
+        val = args[i + 1] if i + 1 < len(args) else ''
+        if val not in ('on', 'off'):
+            sys.exit('--community takes on or off')
+        args.pop(i + 1)
+        cfg['enabled'] = (val == 'on')
+        save_community_config(cfg)
+        print(SHARE_NOTICE if cfg['enabled']
+              else '  Community sharing is OFF. Nothing leaves this machine.')
+        return
+    if '--handle' in args:
+        i = args.index('--handle')
+        name = args[i + 1] if i + 1 < len(args) else ''
+        if not re.match(r'^[A-Za-z0-9_.-]{2,24}$', name):
+            sys.exit('--handle takes 2-24 characters of A-Z a-z 0-9 _ . -')
+        args.pop(i + 1)
+        # The server is the authority here - it screens every handle again on
+        # upload, so this call is for fast feedback, not enforcement.
+        verdict = handle_available(name)
+        if verdict and not verdict.get('ok'):
+            sys.exit('  handle rejected: %s' % verdict.get('reason', 'not allowed'))
+        cfg['handle'], cfg['enabled'] = name, True
+        save_community_config(cfg)
+        print(f'  leaderboard handle set to "{name}" (community sharing enabled).')
+        if verdict is None:
+            print(c('  (could not reach the server to pre-check it; it gets screened '
+                    'again on upload, so a rejected handle never reaches the board)', DIM))
+        print(c('  see where you land with:  claudeusage --leaderboard', DIM))
+        return
+
+    show_graph = '--graph' in args
+    show_board = '--leaderboard' in args
+    if '--check-update' in args:
+        latest = check_update(force=True)
+        print(f'  installed {__version__}; latest {latest or "unknown"}')
+        if latest and latest != __version__:
+            print('  update with:  brew upgrade claudeusage')
+        return
 
     window = 14
     for a in args:
@@ -396,6 +667,16 @@ def main():
                      'cost_out', 'cost_cr', 'cost_cw', 'msgs', 'tools', 'prompts',
                      'compactions', 'sessions', 'unpriced')}
 
+    community = None
+    if cfg.get('enabled') and (show_graph or show_board):
+        community = community_sync(days, cfg, today)
+        if community is None:
+            print(c('  (community server unreachable - showing local data only)', DIM))
+        else:
+            cfg['latest_version'] = community.get('latest_version')
+            cfg['update_checked_at'] = time.time()
+            save_community_config(cfg)
+
     scope = 'CLI only' if cli_only else 'all entrypoints'
     span = 'all time' if window >= 10 ** 6 else f'last {len(keys)} active days'
     print()
@@ -422,6 +703,18 @@ def main():
     if today in keys:
         print(c('  * today - partial day', DIM))
     print()
+
+    # ---- line graph: you vs your average vs everyone
+    if show_graph:
+        heading = '  YOU VS EVERYONE  ·  cost per day'
+        if community:
+            heading += '  ·  %d installs sharing' % (community.get('installs') or 0)
+        elif not cfg.get('enabled'):
+            heading += '  ·  --community on to add everyone else'
+        print(c(heading, BOLD))
+        print(c('  ' + '─' * 74, DIM))
+        line_graph(keys, days, community, today)
+        print()
 
     # ---- where the cost goes
     print(c('  WHERE IT GOES        TOKENS         COST   SHARE', DIM))
@@ -453,6 +746,16 @@ def main():
             print(f"  {name:<24} {v['msgs']:>10,} {toks(v['tokens']):>11} "
                   f"{money(v['cost']):>12}   {share:4.1f}%{flag}")
         print()
+
+    # ---- leaderboard
+    if show_board:
+        if not cfg.get('enabled'):
+            print(c('  LEADERBOARD', BOLD))
+            print(c('  ' + '─' * 74, DIM))
+            print(c('  needs community sharing: run  claudeusage --handle YOURNAME', DIM))
+            print()
+        elif community:
+            render_leaderboard(community, cfg)
 
     # ---- delta block
     n = len(keys)
@@ -515,6 +818,7 @@ def main():
         print(c(f"\n  note: {toks(tot['unpriced'])} tokens from unpriced models excluded from cost", YEL))
     print(c('\n  equivalent API cost at list price; on a subscription this is rate-limit weight,', DIM))
     print(c('  not a bill. Cache writes without a TTL field are priced at the 1h rate.', DIM))
+    update_banner(community.get('latest_version') if community else check_update(cfg))
     print()
 
 
